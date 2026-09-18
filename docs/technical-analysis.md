@@ -188,3 +188,27 @@ All tests ran the candidate from the repo path with the deployed v1.0 stopped. A
 `gone` is high by design: main is killed first, and most Chromium children exit on their own as it dies.
 
 One defect was found and fixed during testing. A process caught mid-exit still returns a `Process` object, but with an empty name, and the PID-reuse guard counted it as `skipped`. An empty name is now classified as `gone`; `skipped` is reserved for a genuine name mismatch.
+
+### Acceptance test (2026-09-18)
+
+Every test above ran a candidate started by hand from the repo path, in most cases with a helper script orchestrating the steps around the close. The acceptance test removed all of that scaffolding. It exercised the installed artifact: the deployed script in `%USERPROFILE%\.claude\scripts`, launched by the registered `KlodDeZombifier` scheduled task, at production defaults (30 s grace, 15 min heartbeat), with no dry run, no orchestrator and no decoy.
+
+Baseline immediately before the close: watchdog PID 26032, parented to the Task Scheduler service, `ARMED` on main PID 27368, with a tree of 16 `claude.exe` plus 4 children (two `conhost.exe`, one `powershell.exe`, one `bash.exe`). Three heartbeats logged 15 minutes apart confirmed the configured interval.
+
+| Measure | Result |
+|---|---|
+| Window loss detected | 13:57:26.357 |
+| Kill complete | 13:57:26.806 -- 449 ms after detection |
+| Counters | `killed=4 gone=15 skipped=0 denied=0` |
+| Processes left in tree | 0 |
+| Re-attached and `ARMED` on the new instance | 13:57:30.261, about 4 s after the close |
+
+The 19 processes accounted for are one fewer than the 20 in the baseline; short-lived helper processes come and go between a snapshot and the close, so the two counts are not expected to match exactly.
+
+Three properties this run established that the earlier tests did not:
+
+- **`skipped=0` under production timing.** The mid-exit misclassification found and fixed during testing does not recur.
+- **The watchdog survives the kill it performs.** It was still PID 26032 afterwards. Because the scheduled task parents it to the Task Scheduler service rather than to Claude, it is never a member of the tree rooted at the Claude main PID, and so never a member of its own kill set. Without that property it would terminate itself mid-kill and nothing would re-attach.
+- **What was tested is what a user installs.** The script, the task registration and the defaults were all the ones the README produces.
+
+**Not yet exercised:** the `AtLogOn` trigger itself. Every run so far has been started with `Start-ScheduledTask` or directly, which uses the same action and settings but does not prove the trigger fires at logon. The first real confirmation will be the log's `KLOD DEZOMBIFIER v1.1 STARTED` line after a reboot or a logoff/logon.

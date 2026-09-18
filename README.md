@@ -112,6 +112,8 @@ Only the process tree **rooted at the watched Desktop main PID** is ever killed:
 
 Windows keeps a process's parent PID even after the parent has died, so the tree is still found correctly after a crash. Before each kill, the process is re-checked to confirm the PID still belongs to the same-named process (guards against PID reuse). If `Stop-Process` is denied, `taskkill /F` is tried.
 
+The watchdog itself sits outside that tree: the scheduled task parents it to the Task Scheduler service, not to Claude, so it is never part of its own kill set and survives to re-attach to the next instance.
+
 ### Performance
 
 - **Detection latency**: ~500 ms (one polling cycle)
