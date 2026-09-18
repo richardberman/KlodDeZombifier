@@ -60,6 +60,24 @@ A lightweight PowerShell script runs hidden in the background and watches for th
 - **CPU usage while watching**: negligible (sleeping between polls)
 - **Memory**: ~30 MB (single hidden PowerShell process)
 
+## Is Anything Worth Keeping Alive?
+
+Short answer: no. Every surviving process is either dead infrastructure or a pipe with no reader.
+
+| Process | Worth keeping? | Why not |
+|---|---|---|
+| Main Electron process | No | Runs headless with no window and no tray icon. There is no way to reattach to it or interact with it. |
+| Crashpad, GPU, network, audio, video, renderers | No | Chromium infrastructure that only serves a window that no longer exists. |
+| MCP servers (node services) | No | Communicate with the parent over stdio. Orphaned, they have no client. |
+| Claude Code CLI (`--resume`) | No | Its only consumer was the Code tab that was just destroyed. |
+| `conhost.exe`, `bash.exe`, `powershell.exe` | No | Child processes of the above, and the most common holders of the file locks that block restart. |
+
+### The one edge case
+
+If you close the window while a long-running command started by Claude Code (a build, a deploy) is still executing, that command is killed with everything else. In practice this loses nothing you could have used: the command's output was going to Claude's tool pipeline, not to a terminal you can see, and the window that would have displayed the result is gone.
+
+If you need work to survive independently of the app, start it in your own terminal rather than through Claude.
+
 ## Installation
 
 ### 1. Copy the script
