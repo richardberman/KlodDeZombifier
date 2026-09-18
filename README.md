@@ -45,19 +45,33 @@ Because **closing the window does not exit the main process.** The Electron main
 
 ## How It Works
 
-A lightweight PowerShell script runs hidden in the background and watches for the Claude Desktop window to disappear using the Win32 API. When it does, the script kills every orphaned process within ~500ms.
+A single hidden PowerShell process runs in the background as a small state machine, polling every 500 ms.
 
-1. **Discovery** -- Polls every 3 seconds until Claude Desktop is running.
-2. **Window monitoring** -- Polls every 500ms using Win32 P/Invoke (`EnumWindows` + `IsWindowVisible` + `GetWindowTextLength`) to check if any `claude.exe` process owns a visible, titled window.
-3. **Minimize safety** -- Minimized windows retain the `WS_VISIBLE` flag (`IsWindowVisible` returns `True`). The watchdog only triggers when the window is *destroyed* (closed), never when minimized. This was verified empirically.
-4. **Kill** -- When no visible titled windows remain, force-terminates every `claude.exe` and walks the full descendant tree to catch `conhost.exe`, `bash.exe`, `powershell.exe`, and any other children. Falls back to `taskkill /F` if `Stop-Process` is denied.
-5. **Re-attach** -- After a 2-second cooldown, loops back to step 1 and watches the next Claude instance.
+| State | What it does |
+|---|---|
+| `SEARCHING` | Looks for the Claude Desktop main process every 3 s (a cheap `Get-Process` pre-check; the WMI query only runs when a `claude.exe` exists). |
+| `ATTACHED` | Main process found. Waits up to the grace period (default 30 s) for it to show a visible, titled window. A main that never shows one is a headless zombie left over from an earlier session -- its tree is killed when the grace period expires. |
+| `ARMED` | The window has been seen. When it disappears, the user closed Claude: the process tree rooted at that main PID is killed within ~500 ms. |
+
+In `ATTACHED` or `ARMED`, the main process dying (a crash) also kills the tree.
+
+Window detection uses Win32 `EnumWindows` + `IsWindowVisible` + `GetWindowTextLength` on the main process's PID. Minimized windows retain the `WS_VISIBLE` flag, so **minimize never triggers cleanup** -- this was verified empirically.
+
+### Kill scope
+
+Only the process tree **rooted at the watched Desktop main PID** is ever killed: the main process, every process whose parent is main, and all of their descendants (`conhost.exe`, `bash.exe`, `powershell.exe`, and so on). Nothing outside that tree is touched, which means:
+
+- A standalone Claude Code CLI running in your own terminal is not affected.
+- A new Claude Desktop instance starting during an update relaunch is not affected.
+
+Windows keeps a process's parent PID even after the parent has died, so the tree is still found correctly after a crash. Before each kill, the process is re-checked to confirm the PID still belongs to the same-named process (guards against PID reuse). If `Stop-Process` is denied, `taskkill /F` is tried.
 
 ### Performance
 
-- **Detection latency**: ~500ms (one polling cycle)
+- **Detection latency**: ~500 ms (one polling cycle)
 - **Kill time**: under 1 second
-- **CPU usage while watching**: negligible (sleeping between polls)
+- **Steady-state cost while Claude is open**: one `EnumWindows` call per 500 ms, no process enumeration
+- **Cost while Claude is closed**: one `Get-Process` call per 3 s
 - **Memory**: ~30 MB (single hidden PowerShell process)
 
 ## Is Anything Worth Keeping Alive?
@@ -89,21 +103,44 @@ Copy-Item klod-dezombifier.ps1 "$env:USERPROFILE\.claude\scripts\"
 
 ### 2. Register a scheduled task (runs automatically at logon)
 
+Run from an **elevated** PowerShell (right-click, "Run as administrator"):
+
 ```powershell
 Register-ScheduledTask -TaskName "KlodDeZombifier" `
     -Action (New-ScheduledTaskAction `
         -Execute "powershell.exe" `
-        -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$env:USERPROFILE\.claude\scripts\klod-dezombifier.ps1`"") `
+        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$env:USERPROFILE\.claude\scripts\klod-dezombifier.ps1`"") `
     -Trigger (New-ScheduledTaskTrigger -AtLogOn) `
     -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit ([TimeSpan]::Zero))
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1))
 ```
+
+`-NoProfile` keeps your PowerShell profile out of the watchdog. `-RestartCount` brings it back if it ever crashes.
 
 ### 3. Start it now (without waiting for next logon)
 
 ```powershell
 Start-ScheduledTask -TaskName "KlodDeZombifier"
 ```
+
+Only one instance runs per logon session; starting it twice is harmless (the second exits immediately).
+
+## Options
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `-DryRun` | off | Log what would be killed; kill nothing. Useful for checking scope on your machine. |
+| `-GraceSeconds N` | 30 | How long an attached main process may run without a window before it is treated as a zombie. Raise it on a slow machine. |
+| `-HeartbeatMinutes N` | 15 | Interval of the "still alive" log line. |
+| `-LogPath PATH` | `klod-dezombifier.log` next to the script | Log location. Rotated to `.old` when it exceeds 1 MB. |
+
+To try a dry run in the foreground:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\scripts\klod-dezombifier.ps1" -DryRun
+```
+
+Close Claude, read the log, then press Ctrl+C. (The scheduled-task instance must be stopped first, or the dry run exits at once because of the single-instance guard.)
 
 ## Verifying It Works
 
@@ -115,49 +152,53 @@ Get-CimInstance Win32_Process | Where-Object {
 } | Select-Object ProcessId, CreationDate
 ```
 
-Check the debug log after a close/reopen cycle:
+Check the log after a close/reopen cycle:
 
 ```powershell
-Get-Content "$env:USERPROFILE\.claude\scripts\klod-dezombifier-debug.log" | Select-Object -Last 10
+Get-Content "$env:USERPROFILE\.claude\scripts\klod-dezombifier.log" | Select-Object -Last 10
 ```
 
-A successful kill looks like:
+A successful cycle looks like:
 
 ```
-10:39:13.476  Poll: NO visible titled window (procs=15), TRIGGERING KILL
-10:39:13.481  Kill-ClaudeTree: starting
-10:39:13.782  Kill-ClaudeTree: killing 18 processes
-10:39:13.857  Kill-ClaudeTree: done. killed=5 gone=13 denied=0
-10:39:14.389  Kill-ClaudeTree: remaining claude.exe after kill: 0
+2026-09-18 12:01:05.123  SEARCHING -> ATTACHED: main PID=40676 (created 09/18/2026 11:58:02); waiting up to 30s for a window
+2026-09-18 12:01:05.640  ATTACHED -> ARMED: window seen for main PID=40676
+2026-09-18 12:14:33.902  ARMED: window lost for main PID=40676; user closed Claude
+2026-09-18 12:14:33.907  Kill: starting (root=40676 reason='window closed')
+2026-09-18 12:14:34.310  Kill: done. killed=19 gone=0 skipped=0 denied=0
+2026-09-18 12:14:34.822  Kill: remaining in tree after kill: 0
 ```
 
 - **killed**: processes terminated by the watchdog
-- **gone**: processes that had already exited (normal race condition -- harmless)
+- **gone**: processes that had already exited on their own (harmless)
+- **skipped**: PIDs that no longer belonged to the expected process (PID-reuse guard; should be 0)
 - **denied**: processes that resisted termination (should be 0)
+
+A `Heartbeat: state=ARMED mainPid=40676` line every 15 minutes confirms the watchdog is alive and attached.
 
 ## Removal
 
 ```powershell
 Unregister-ScheduledTask -TaskName "KlodDeZombifier" -Confirm:$false
 Remove-Item "$env:USERPROFILE\.claude\scripts\klod-dezombifier.ps1"
-Remove-Item "$env:USERPROFILE\.claude\scripts\klod-dezombifier-debug.log" -ErrorAction SilentlyContinue
+Remove-Item "$env:USERPROFILE\.claude\scripts\klod-dezombifier.log*" -ErrorAction SilentlyContinue
 ```
 
 ## Limitations
 
 - **Session-level orphans** -- Closing an individual Code tab (without closing the whole app) can also leave orphaned subprocesses. These accumulate until the main app is closed, at which point the watchdog kills them all.
 - **Silo corruption** -- If Claude crashes during startup, the MSIX Silo handle may not be released. The watchdog cleans up the processes but cannot recover the Silo; logoff or reboot is required.
-- **Fast reopen race** -- If you reopen Claude within ~1 second of closing, the watchdog may kill some processes belonging to the new instance. The new instance recovers by respawning its children (brief flicker, no data loss).
+- **Reopen within ~1 second of closing** -- Claude's launcher hands a reopen request to an existing main process if one is still alive. If you click the icon while the old tree is being killed, that request can be lost and nothing appears; click again. The new instance is never killed.
 
 ## Requirements
 
 - Windows 10 or 11
-- PowerShell 5.1+ (included with Windows)
+- Windows PowerShell 5.1 (included with Windows), running in FullLanguage mode. The script compiles a small C# helper with `Add-Type`; Constrained Language Mode or AppLocker DLL rules will block it (the log will say so).
 - Claude Desktop (MSIX package)
 
 ## Technical Details
 
-See [docs/technical-analysis.md](docs/technical-analysis.md) for the full root cause analysis, process inventory, upstream GitHub issue references, empirical test results, bugs discovered during development, and alternatives considered.
+See [docs/technical-analysis.md](docs/technical-analysis.md) for the full root cause analysis, process inventory, upstream GitHub issue references, empirical test results, bugs discovered during development, the v1.1 hardening review, and alternatives considered.
 
 ## License
 

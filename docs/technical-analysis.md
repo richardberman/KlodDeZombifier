@@ -144,3 +144,47 @@ Fixed by using only ASCII characters in all strings.
 | **C# Win32 Job Objects** | MSIX apps already run inside a Desktop Bridge Job Object. Assigning to a second Job Object from an external process is unreliable. Requires a compiled binary. |
 | **WMI permanent event subscription** | Requires admin privileges and `SeDebugPrivilege`. Permanent subscriptions are fragile and persist in the WMI repository even after script deletion. |
 | **WMI temporary event** | Requires `WITHIN` polling (minimum 1s), no faster than the current approach while being more complex. |
+
+## v1.1 Hardening
+
+A post-publish code and security review of v1.0 found eight issues. All are fixed in v1.1.
+
+| # | Finding | Severity | Fix |
+|---|---|---|---|
+| 1 | The kill targeted every process named `claude.exe` on the machine. A standalone Claude Code CLI (native install: `~\.local\bin\claude.exe`) in the user's own terminal died with Desktop, along with whatever it was running. The same over-scoping killed a new instance starting during an update relaunch. | High | Kill is rooted at the watched Desktop main PID: seed = main plus every process whose `ParentProcessId` is main, then walk descendants. WMI retains `ParentProcessId` on orphans, so the crash path still works. |
+| 2 | The trigger armed immediately on attach, so a cold start slower than one 500 ms poll was killed before its window appeared. | High | State machine `SEARCHING -> ATTACHED -> ARMED`. Kill-on-window-loss only after a window has been seen. An attached main that never shows a window within the grace period (default 30 s) is treated as a headless zombie and killed. |
+| 3 | The scheduled task ran without `-NoProfile`, so the user's profile scripts executed inside the watchdog at every logon. | Medium | `-NoProfile -NonInteractive`; the task also gets `-RestartCount 3 -RestartInterval 1 min`. |
+| 4 | No exception handling around the main loop; a .NET exception ended the watchdog silently until next logon. | Medium | Loop body in `try/catch` with a logged error and 5 s back-off. Heartbeat line every 15 min (configurable) so "alive but blind" is visible in the log. |
+| 5 | Force-kill by PID from a stale snapshot; PID reuse in the gap could hit an unrelated process. | Low | Each PID is re-fetched and its process name compared with the snapshot before `Stop-Process`; mismatches are counted as `skipped`. |
+| 6 | Discovery ran an unfiltered `Win32_Process` query (200-350 ms) every 3 s while Claude was closed. | Low | `Get-Process -Name claude` pre-check first; the WMI query is WQL-filtered to `Name = 'claude.exe'`. |
+| 7 | No single-instance guard; a manual launch plus the scheduled task produced two watchdogs. | Low | Named mutex `Local\KlodDeZombifier`; a second instance logs and exits 0. |
+| 8 | File saved as UTF-8 without BOM (the em-dash parse-failure class), hardcoded log path, unbounded log growth, no Constrained Language Mode note. | Low | Saved with BOM and an ASCII-only rule in the header; log defaults to `$PSScriptRoot`; rotated at 1 MB; README states the FullLanguage requirement. |
+
+### Scope verification
+
+Measured on the live process tree before implementing fix #1:
+
+- The only visible titled window ("Claude") is owned by the main Electron process. The window check therefore watches a single PID, and the poll loop no longer enumerates processes at all.
+- All 14 other `claude.exe` processes are direct children of main (9 utility, 2 renderer, gpu, crashpad, Code CLI). `conhost.exe`, `bash.exe`, and `powershell.exe` hang off the Code CLI and one utility child. Seeding the tree with main's direct children and walking descendants captures everything.
+
+### Test evidence (2026-09-18)
+
+All tests ran the candidate from the repo path with the deployed v1.0 stopped. A decoy process named `claude.exe` (a renamed `ping.exe`, outside the Desktop tree) ran throughout; v1.0's name-based sweep would have killed it.
+
+| Test | Result |
+|---|---|
+| Static: parse, UTF-8 BOM, ASCII-only, no automatic-variable misuse | Pass |
+| Single instance: second copy logs "already running" and exits | Pass |
+| Log path defaults to the script's folder when launched from another directory | Pass |
+| Heartbeat at the configured interval | Pass (60 s interval, consecutive lines 60 s apart) |
+| Idle gate | `Get-Process` pre-check ~31 ms vs ~280 ms for the WMI query it avoids. The WQL filter itself does not make the WMI query cheaper; the saving comes from skipping it. |
+| Minimize/restore while `ARMED` | No trigger |
+| Dry run on window close | 23-process would-kill list: main, its 14 `claude.exe` children, and their `conhost`/`bash`/`powershell` descendants. Decoy absent. |
+| Headless zombie found at watchdog start | No window within grace -> tree killed (`killed=5 gone=15 skipped=0 denied=0`, 0 remaining) |
+| Attach to a starting instance | `ATTACHED -> ARMED` in ~0.5 s, no kill |
+| Window close while `ARMED` (production defaults) | `killed=4 gone=14 skipped=0 denied=0`, 0 remaining, ~0.4 s |
+| Decoy `claude.exe` | Alive after one dry run and three real kills |
+
+`gone` is high by design: main is killed first, and most Chromium children exit on their own as it dies.
+
+One defect was found and fixed during testing. A process caught mid-exit still returns a `Process` object, but with an empty name, and the PID-reuse guard counted it as `skipped`. An empty name is now classified as `gone`; `skipped` is reserved for a genuine name mismatch.
