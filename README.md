@@ -14,16 +14,20 @@ New-Item -ItemType Directory -Path "$env:USERPROFILE\.claude\scripts" -Force
 Copy-Item klod-dezombifier.ps1 "$env:USERPROFILE\.claude\scripts\"
 
 # Run it at every logon
-Register-ScheduledTask -TaskName "KlodDeZombifier" `
-    -Action (New-ScheduledTaskAction `
-        -Execute "powershell.exe" `
-        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$env:USERPROFILE\.claude\scripts\klod-dezombifier.ps1`"") `
-    -Trigger (New-ScheduledTaskTrigger -AtLogOn) `
-    -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1))
+$script   = "$env:USERPROFILE\.claude\scripts\klod-dezombifier.ps1"
+$psArgs   = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden"
+$action   = New-ScheduledTaskAction -Execute powershell.exe `
+                -Argument "$psArgs -File `"$script`""
+$trigger  = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+                -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+
+Register-ScheduledTask -TaskName KlodDeZombifier `
+    -Action $action -Trigger $trigger -Settings $settings
 
 # Start it now, without waiting for the next logon
-Start-ScheduledTask -TaskName "KlodDeZombifier"
+Start-ScheduledTask -TaskName KlodDeZombifier
 ```
 
 That is the entire install. `-NoProfile` keeps your PowerShell profile out of the watchdog; `-RestartCount` brings it back if it ever crashes. Only one instance runs per logon session, so starting it twice is harmless.
@@ -38,7 +42,7 @@ You want a `Kill: done.` line ending in `denied=0`, followed by `remaining in tr
 
 ## The Problem
 
-Claude Desktop for Windows is distributed as an MSIX package. Every session runs **15 separate processes** -- the main Electron app plus 14 child processes for rendering, networking, GPU, audio, and more. When you close the window, **none of them terminate.** The main process continues running headless with no tray icon, and all children survive as zombies.
+Claude Desktop for Windows is distributed as an MSIX package. Every session runs **15 separate processes** — the main Electron app plus 14 child processes for rendering, networking, GPU, audio, and more. When you close the window, **none of them terminate.** The main process continues running headless with no tray icon, and all children survive as zombies.
 
 These zombies hold file locks. The next time you try to open Claude, you get:
 
@@ -52,7 +56,7 @@ It's not just `claude.exe`. Every close leaves behind a full process tree:
 
 | Process | Count | Role |
 |---|---|---|
-| `claude.exe` (main) | 1 | Electron app -- continues running headless after window close |
+| `claude.exe` (main) | 1 | Electron app — continues running headless after window close |
 | `claude.exe` (crashpad) | 1 | Crash reporting |
 | `claude.exe` (GPU) | 1 | Hardware-accelerated rendering |
 | `claude.exe` (network) | 1 | HTTP stack |
@@ -69,7 +73,7 @@ That's **15+ processes** surviving every close. `conhost.exe`, `bash.exe`, and `
 
 ### Why It Happens
 
-On Unix, child processes die with their parent. On Windows, they don't -- they become orphans owned by the system. Chromium normally handles this using **Win32 Job Objects** (a kernel construct that kills member processes when the owner exits). But MSIX-packaged apps run inside a Desktop Bridge **Silo**, which is itself a Job Object. The Silo interferes with Electron's Job Object initialization, preventing automatic cleanup.
+On Unix, child processes die with their parent. On Windows, they don't — they become orphans owned by the system. Chromium normally handles this using **Win32 Job Objects** (a kernel construct that kills member processes when the owner exits). But MSIX-packaged apps run inside a Desktop Bridge **Silo**, which is itself a Job Object. The Silo interferes with Electron's Job Object initialization, preventing automatic cleanup.
 
 This is a [known, widely-reported upstream bug](docs/technical-analysis.md#related-github-issues) with 10+ open issues on GitHub.
 
@@ -77,11 +81,11 @@ This is a [known, widely-reported upstream bug](docs/technical-analysis.md#relat
 
 Three facts about the failure decide the whole design:
 
-1. **The window dies; the process does not.** Closing Claude destroys the window, but the main Electron process keeps running headless -- no window, no tray icon, no way to reach it. There is no process exit to wait for, so `Wait-Process` blocks forever and a Job Object around the app never fires.
+1. **The window dies; the process does not.** Closing Claude destroys the window, but the main Electron process keeps running headless — no window, no tray icon, no way to reach it. There is no process exit to wait for, so `Wait-Process` blocks forever and a Job Object around the app never fires.
 2. **Windows never signals parent death.** Orphans keep running until something explicitly kills them. Chromium normally handles this with its own Job Object, which the MSIX Desktop Bridge Silo breaks.
 3. **Minimizing is not closing.** A minimized window keeps its `WS_VISIBLE` flag and stays in `EnumWindows`. Only a destroyed window disappears.
 
-So the one reliable signal that you are done with Claude is **the disappearance of a visible, titled window owned by the main process**. That is the single thing this watchdog measures. When it goes, everything rooted at that main PID is killed -- which is safe precisely because, as [below](#is-anything-worth-keeping-alive), nothing in that tree has any purpose once the window is gone.
+So the one reliable signal that you are done with Claude is **the disappearance of a visible, titled window owned by the main process**. That is the single thing this watchdog measures. When it goes, everything rooted at that main PID is killed — which is safe precisely because, as [below](#is-anything-worth-keeping-alive), nothing in that tree has any purpose once the window is gone.
 
 Everything that follows is the implementation of that one idea.
 
@@ -92,12 +96,12 @@ A single hidden PowerShell process runs in the background as a small state machi
 | State | What it does |
 |---|---|
 | `SEARCHING` | Looks for the Claude Desktop main process every 3 s (a cheap `Get-Process` pre-check; the WMI query only runs when a `claude.exe` exists). |
-| `ATTACHED` | Main process found. Waits up to the grace period (default 30 s) for it to show a visible, titled window. A main that never shows one is a headless zombie left over from an earlier session -- its tree is killed when the grace period expires. |
+| `ATTACHED` | Main process found. Waits up to the grace period (default 30 s) for it to show a visible, titled window. A main that never shows one is a headless zombie left over from an earlier session — its tree is killed when the grace period expires. |
 | `ARMED` | The window has been seen. When it disappears, the user closed Claude: the process tree rooted at that main PID is killed within ~500 ms. |
 
 In `ATTACHED` or `ARMED`, the main process dying (a crash) also kills the tree.
 
-Window detection uses Win32 `EnumWindows` + `IsWindowVisible` + `GetWindowTextLength` on the main process's PID. Minimized windows retain the `WS_VISIBLE` flag, so **minimize never triggers cleanup** -- this was verified empirically.
+Window detection uses Win32 `EnumWindows` + `IsWindowVisible` + `GetWindowTextLength` on the main process's PID. Minimized windows retain the `WS_VISIBLE` flag, so **minimize never triggers cleanup** — this was verified empirically.
 
 ### Kill scope
 
@@ -195,9 +199,9 @@ Remove-Item "$env:USERPROFILE\.claude\scripts\klod-dezombifier.log*" -ErrorActio
 
 ## Limitations
 
-- **Session-level orphans** -- Closing an individual Code tab (without closing the whole app) can also leave orphaned subprocesses. These accumulate until the main app is closed, at which point the watchdog kills them all.
-- **Silo corruption** -- If Claude crashes during startup, the MSIX Silo handle may not be released. The watchdog cleans up the processes but cannot recover the Silo; logoff or reboot is required.
-- **Reopen within ~1 second of closing** -- Claude's launcher hands a reopen request to an existing main process if one is still alive. If you click the icon while the old tree is being killed, that request can be lost and nothing appears; click again. The new instance is never killed.
+- **Session-level orphans** — Closing an individual Code tab (without closing the whole app) can also leave orphaned subprocesses. These accumulate until the main app is closed, at which point the watchdog kills them all.
+- **Silo corruption** — If Claude crashes during startup, the MSIX Silo handle may not be released. The watchdog cleans up the processes but cannot recover the Silo; logoff or reboot is required.
+- **Reopen within ~1 second of closing** — Claude's launcher hands a reopen request to an existing main process if one is still alive. If you click the icon while the old tree is being killed, that request can be lost and nothing appears; click again. The new instance is never killed.
 
 ## Requirements
 
