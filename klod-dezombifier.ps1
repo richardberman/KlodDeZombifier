@@ -132,7 +132,13 @@ function Find-MainClaudeProcess {
 # Root (if still alive and still claude.exe) plus every descendant, found by
 # walking ParentProcessId. WMI keeps ParentProcessId on orphans, so the
 # children are still found after the root has died.
-function Get-ProcessTree([int]$RootPid) {
+#
+# ExcludePid and everything below it are subtracted from the result. This is a
+# set rather than a skipped node because ParentProcessId is never revalidated:
+# a long-lived process whose real parent died keeps reporting that pid, and if
+# the pid is later reused by something inside the target tree, the walk reaches
+# an unrelated process. Subtracting the set means no path can reach us.
+function Get-ProcessTree([int]$RootPid, [int]$ExcludePid) {
     $all = Get-CimInstance Win32_Process
     $byPid = @{}
     $byParent = @{}
@@ -143,13 +149,30 @@ function Get-ProcessTree([int]$RootPid) {
         [void]$byParent[$parent].Add($p)
     }
 
+    $selfSet = [System.Collections.Generic.HashSet[int]]::new()
+    if ($ExcludePid -gt 0) {
+        [void]$selfSet.Add($ExcludePid)
+        $sq = [System.Collections.Queue]::new()
+        $sq.Enqueue($ExcludePid)
+        while ($sq.Count -gt 0) {
+            $sp = $sq.Dequeue()
+            if (-not $byParent.ContainsKey($sp)) { continue }
+            foreach ($sc in $byParent[$sp]) {
+                $scPid = [int]$sc.ProcessId
+                if ($scPid -ne $sp -and $selfSet.Add($scPid)) { $sq.Enqueue($scPid) }
+            }
+        }
+    }
+
     $result = New-Object System.Collections.ArrayList
     $seen = [System.Collections.Generic.HashSet[int]]::new()
     [void]$seen.Add($RootPid)
-    if ($byPid.ContainsKey($RootPid) -and $byPid[$RootPid].Name -eq 'claude.exe') {
+    if ($byPid.ContainsKey($RootPid) -and $byPid[$RootPid].Name -eq 'claude.exe' -and
+        -not $selfSet.Contains($RootPid)) {
         [void]$result.Add($byPid[$RootPid])
     }
 
+    $excluded = 0
     $queue = [System.Collections.Queue]::new()
     $queue.Enqueue($RootPid)
     while ($queue.Count -gt 0) {
@@ -157,22 +180,40 @@ function Get-ProcessTree([int]$RootPid) {
         if (-not $byParent.ContainsKey($parent)) { continue }
         foreach ($child in $byParent[$parent]) {
             $childPid = [int]$child.ProcessId
-            if ($childPid -ne $parent -and $seen.Add($childPid)) {
+            if ($childPid -eq $parent) { continue }
+            if ($selfSet.Contains($childPid)) {
+                $excluded++
+                Log "Tree: EXCLUDED self/own-child PID $childPid ($($child.Name)) reached via parent $parent"
+                continue
+            }
+            if ($seen.Add($childPid)) {
                 [void]$result.Add($child)
                 $queue.Enqueue($childPid)
             }
         }
     }
+    # $excluded counts paths blocked, not processes spared: blocking the first
+    # hop keeps the whole subtree out without the walk ever reaching it.
+    if ($excluded -gt 0) {
+        Log "Tree: self-exclusion blocked $excluded path(s) into our own subtree ($($selfSet.Count) process(es))"
+    }
     return ,$result
 }
 
 function Kill-ClaudeTree([int]$RootPid, [string]$Reason) {
-    Log "Kill: starting (root=$RootPid reason='$Reason')"
-    $tree = Get-ProcessTree -RootPid $RootPid
+    Log "Kill: starting (root=$RootPid reason='$Reason' selfPid=$PID)"
+    if ($RootPid -eq $PID) {
+        Log "Kill: ABORT - root is our own pid; refusing to kill ourselves"
+        return
+    }
+    $tree = Get-ProcessTree -RootPid $RootPid -ExcludePid $PID
     if ($tree.Count -eq 0) {
         Log "Kill: tree is empty, nothing to do"
         return
     }
+
+    # Belt and braces: nothing below may target this process under any path.
+    $tree = @($tree | Where-Object { [int]$_.ProcessId -ne $PID })
 
     if ($DryRun) {
         Log "Kill: DRY RUN - would kill $($tree.Count) processes:"
@@ -217,8 +258,9 @@ function Kill-ClaudeTree([int]$RootPid, [string]$Reason) {
     Log "Kill: done. killed=$killed gone=$gone skipped=$skipped denied=$denied"
 
     Start-Sleep -Milliseconds 500
-    $remaining = (Get-ProcessTree -RootPid $RootPid).Count
+    $remaining = (Get-ProcessTree -RootPid $RootPid -ExcludePid $PID).Count
     Log "Kill: remaining in tree after kill: $remaining"
+    Log "Kill: returning to caller (still alive, pid $PID)"
 }
 
 $state = 'SEARCHING'
@@ -252,7 +294,9 @@ while ($true) {
                 Log "ATTACHED: main PID=$mainPid exited before showing a window"
                 Kill-ClaudeTree -RootPid $mainPid -Reason 'main exited before window'
                 $state = 'SEARCHING'
+                Log "Post-kill: entering 2s cooldown"
                 Start-Sleep -Seconds 2
+                Log "Post-kill: cooldown done, resuming poll loop"
             }
             elseif ([ClaudeWindowChecker]::PidHasVisibleTitledWindow($mainPid)) {
                 $state = 'ARMED'
@@ -262,7 +306,9 @@ while ($true) {
                 Log "ATTACHED: no window within ${GraceSeconds}s; main PID=$mainPid is a headless zombie"
                 Kill-ClaudeTree -RootPid $mainPid -Reason 'grace expired without window'
                 $state = 'SEARCHING'
+                Log "Post-kill: entering 2s cooldown"
                 Start-Sleep -Seconds 2
+                Log "Post-kill: cooldown done, resuming poll loop"
             }
         }
         elseif ($state -eq 'ARMED') {
@@ -271,13 +317,17 @@ while ($true) {
                 Log "ARMED: main PID=$mainPid is dead (crash)"
                 Kill-ClaudeTree -RootPid $mainPid -Reason 'main exited'
                 $state = 'SEARCHING'
+                Log "Post-kill: entering 2s cooldown"
                 Start-Sleep -Seconds 2
+                Log "Post-kill: cooldown done, resuming poll loop"
             }
             elseif (-not [ClaudeWindowChecker]::PidHasVisibleTitledWindow($mainPid)) {
                 Log "ARMED: window lost for main PID=$mainPid; user closed Claude"
                 Kill-ClaudeTree -RootPid $mainPid -Reason 'window closed'
                 $state = 'SEARCHING'
+                Log "Post-kill: entering 2s cooldown"
                 Start-Sleep -Seconds 2
+                Log "Post-kill: cooldown done, resuming poll loop"
             }
         }
     } catch {
