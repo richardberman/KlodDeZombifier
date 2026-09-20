@@ -208,7 +208,53 @@ The 19 processes accounted for are one fewer than the 20 in the baseline; short-
 Three properties this run established that the earlier tests did not:
 
 - **`skipped=0` under production timing.** The mid-exit misclassification found and fixed during testing does not recur.
-- **The watchdog survives the kill it performs.** It was still PID 26032 afterwards. Because the scheduled task parents it to the Task Scheduler service rather than to Claude, it is never a member of the tree rooted at the Claude main PID, and so never a member of its own kill set. Without that property it would terminate itself mid-kill and nothing would re-attach.
-- **What was tested is what a user installs.** The script, the task registration and the defaults were all the ones the README produces.
+- **The kill works end to end from the installed artifact.** Window loss to empty tree in 449 ms, with the script, task registration and defaults a user would actually get.
+- **The watchdog was still alive immediately afterwards** (PID 26032), so the kill does not synchronously take it down.
 
-**Not yet exercised:** the `AtLogOn` trigger itself. Every run so far has been started with `Start-ScheduledTask` or directly, which uses the same action and settings but does not prove the trigger fires at logon. The first real confirmation will be the log's `KLOD DEZOMBIFIER v1.1 STARTED` line after a reboot or a logoff/logon.
+**A claim this section previously made, now withdrawn.** It asserted that "the watchdog survives the kill it performs," treating one observation as a general property. Nineteen minutes after this run the same process was gone, and two further instances died without performing any kill at all. Surviving a kill once did not establish that it survives kills, and the claim should never have been written in that form. See [Unexplained termination](#unexplained-termination-open) below.
+
+**The `AtLogOn` trigger** was confirmed on 2026-09-18: a logoff/logon cycle produced a fresh `KLOD DEZOMBIFIER v1.1 STARTED` line at 15:09:32 with a new PID parented to the Task Scheduler service.
+
+## Unexplained termination (open)
+
+The watchdog process is terminated by something external at irregular intervals. **The cause is unknown.**
+
+| # | Started | Died | Lifetime | Context |
+|---|---|---|---|---|
+| A | 09-18 13:08:13 | between 14:08:15 and 15:07:13 | 60–119 min | Idle; had performed a successful kill at 13:57 and survived it |
+| B | 09-18 15:15:22 | 09-18 15:18:29 | 3 min | ~5 s after completing a kill |
+| C | 09-19 22:26:56 | 09-19 22:49:23 | 22 min | Idle in the poll loop; Claude open since 21:33 and never closed; no kill had run |
+
+Identical signature every time:
+
+- Task Scheduler records the action ending with `3221225786` = `0xC000013A` = `STATUS_CONTROL_C_EXIT`.
+- The script's `try/catch` never fires and nothing is written to its log; the last line is whatever it was doing normally.
+- Task Scheduler logs `id=201` + `id=102` — *successfully completed* — with no `id=330` (stopped by user) and no `id=111` (terminated by scheduler). It observed the exit; it did not cause it.
+- Because the scheduler sees a normal completion, `RestartOnFailure` never applies.
+
+### Ruled out
+
+| Candidate | Why it is out |
+|---|---|
+| The script's own kill path | Occurrence C performed no kill at all |
+| Killing itself via the tree walk | Self-exclusion guard added and verified; C had no kill regardless |
+| `StopOnIdleEnd` / idle settings | B and C both ran with it `false` |
+| `ExecutionTimeLimit` | `PT0S` (unlimited); lifetimes vary from 3 to 119 min |
+| Task Scheduler stopping it | No `id=330`/`id=111`; an operator stop produces `0x8007041B`, measured 17/17 |
+| The Schedule service restarting | Host PID 2808 continuous across all three deaths |
+| Antivirus | Bitdefender is the only active AV; its own on-disk logs record nothing at any death. McAfee is a stale SecurityCenter2 registration, not installed |
+| PID reuse reaching the watchdog | Only boot-time system processes have stale parents, none related to Claude |
+| A script exception | `try/catch` would have logged it |
+| Someone ending it in Task Manager | Plausible for one occurrence, but C happened while the operator was running an unrelated elevated script |
+
+### Investigation notes
+
+Occurrence B — dying five seconds after a kill — looked like strong evidence the kill was responsible, and a six-lens investigation was built on that premise. Occurrence C falsified it: same signature, no kill, nothing happening. The correlation in B was coincidence. Anyone picking this up should treat the kill path as exonerated and look for an external terminator.
+
+`0xC000013A` is the status Windows sets when a console process is terminated via a console control event, which is why the console family of hypotheses was explored at length. Nothing confirmed one, and no candidate explains a process dying while idle with no console activity anywhere near it.
+
+### Mitigation
+
+The task carries a 10-minute repeat trigger alongside the logon trigger, so an unexplained death costs at most ~10 minutes of cover. `MultipleInstances=IgnoreNew` plus a single-instance mutex in the script make a repeat fire during normal running a no-op.
+
+This does not fix the deaths. It removes the consequence that actually caused harm: on 2026-09-18 the watchdog died at 15:18 and stayed dead for a full day, because the only trigger was at-logon, and the zombies it exists to remove accumulated unnoticed until the operator found them manually in Task Manager.

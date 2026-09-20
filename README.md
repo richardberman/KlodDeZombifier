@@ -21,13 +21,41 @@ $action   = New-ScheduledTaskAction -Execute powershell.exe `
 $trigger  = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
                 -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
-                -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+                -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+                -DontStopOnIdleEnd
 
 Register-ScheduledTask -TaskName KlodDeZombifier `
     -Action $action -Trigger $trigger -Settings $settings
 
 # Start it now, without waiting for the next logon
 Start-ScheduledTask -TaskName KlodDeZombifier
+```
+
+Then add the 10-minute repeat trigger, so the watchdog restarts itself if it
+is ever killed (see [Known issue](#known-issue-the-watchdog-is-terminated-unexpectedly)).
+This needs an XML edit: "repeat forever" is expressed by *omitting* the
+`<Duration>` element, and passing `-RepetitionDuration ([TimeSpan]::MaxValue)`
+to the cmdlet is rejected by the service as out of range.
+
+```powershell
+$xml = [xml](Export-ScheduledTask -TaskName KlodDeZombifier)
+$ns  = $xml.DocumentElement.NamespaceURI
+
+$rep = $xml.CreateElement('Repetition', $ns)
+$i = $xml.CreateElement('Interval', $ns);          $i.InnerText = 'PT10M'
+$s = $xml.CreateElement('StopAtDurationEnd', $ns); $s.InnerText = 'false'
+[void]$rep.AppendChild($i); [void]$rep.AppendChild($s)
+
+$tt = $xml.CreateElement('TimeTrigger', $ns)
+$b = $xml.CreateElement('StartBoundary', $ns)
+$b.InnerText = (Get-Date).AddMinutes(2).ToString('yyyy-MM-ddTHH:mm:ss')
+$e = $xml.CreateElement('Enabled', $ns);           $e.InnerText = 'true'
+[void]$tt.AppendChild($rep); [void]$tt.AppendChild($b); [void]$tt.AppendChild($e)
+
+$nodes = $xml.DocumentElement.SelectSingleNode("//*[local-name()='Triggers']")
+[void]$nodes.AppendChild($tt)
+
+Register-ScheduledTask -TaskName KlodDeZombifier -Xml $xml.OuterXml -Force
 ```
 
 That is the entire install. `-NoProfile` keeps your PowerShell profile out of the watchdog; `-RestartCount` brings it back if it ever crashes. Only one instance runs per logon session, so starting it twice is harmless.
@@ -112,7 +140,39 @@ Only the process tree **rooted at the watched Desktop main PID** is ever killed:
 
 Windows keeps a process's parent PID even after the parent has died, so the tree is still found correctly after a crash. Before each kill, the process is re-checked to confirm the PID still belongs to the same-named process (guards against PID reuse). If `Stop-Process` is denied, `taskkill /F` is tried.
 
-The watchdog itself sits outside that tree: the scheduled task parents it to the Task Scheduler service, not to Claude, so it is never part of its own kill set and survives to re-attach to the next instance.
+The watchdog itself sits outside that tree: the scheduled task parents it to the Task Scheduler service, not to Claude. It also explicitly subtracts its own PID and everything below it from the kill set before terminating anything, so no parent chain can route the walk back into itself.
+
+## Known issue: the watchdog is terminated unexpectedly
+
+**The watchdog process sometimes dies on its own, and the cause is not known.**
+
+Observed three times on the development machine (Windows 11 Pro 26200):
+
+| Started | Died | Lifetime | What was happening |
+|---|---|---|---|
+| 13:08:13 | between 14:08 and 15:07 | 60–119 min | Idle, Claude open |
+| 15:15:22 | 15:18:29 | 3 min | ~5 s after a kill |
+| 22:26:56 | 22:49:23 | 22 min | Idle, Claude open and never closed, no kill had run |
+
+Every time the signature is identical: Task Scheduler records the action ending with return code `3221225786` (`0xC000013A`, `STATUS_CONTROL_C_EXIT`); the script's own `try/catch` never fires; nothing is written to the log; and no Windows event records a cause. Task Scheduler logs it as *successfully completed*, so `RestartOnFailure` does not apply.
+
+Ruled out so far: the script's own kill path (occurrence 3 had no kill), idle settings, `ExecutionTimeLimit`, antivirus (Bitdefender's own logs show nothing), the Task Scheduler service stopping, PID reuse in the tree walk, and self-termination. The second occurrence looked like the kill caused it; the third shows that was coincidence.
+
+If you have seen this and know the mechanism, please open an issue.
+
+### Mitigation: it restarts itself
+
+Because the cause is unknown, the task carries **two** triggers: at logon, and a repeat every 10 minutes. `MultipleInstances` is `IgnoreNew` and the script holds a single-instance mutex, so a repeat firing while it is already running is a no-op — the second copy logs `already running` and exits.
+
+The practical effect is that an unexplained death costs at most ~10 minutes of cover instead of lasting until the next logon. Without the repeat trigger, the watchdog on the development machine died and stayed dead for a full day, and the zombies it exists to remove piled up unnoticed.
+
+### It looks like junk in Task Manager
+
+The watchdog appears under **Background processes** as plain **`Windows PowerShell`**, with no window title, alongside any other PowerShell on the machine. There is nothing to distinguish it — which makes it exactly the kind of entry you end while cleaning up strays.
+
+To identify it: **Details** tab, right-click the column headers, add **Command line**. The watchdog is the one ending in `klod-dezombifier.ps1`.
+
+If you do end it, the repeat trigger brings it back within 10 minutes.
 
 ### Performance
 
@@ -204,6 +264,7 @@ Remove-Item "$env:USERPROFILE\.claude\scripts\klod-dezombifier.log*" -ErrorActio
 - **Session-level orphans** — Closing an individual Code tab (without closing the whole app) can also leave orphaned subprocesses. These accumulate until the main app is closed, at which point the watchdog kills them all.
 - **Silo corruption** — If Claude crashes during startup, the MSIX Silo handle may not be released. The watchdog cleans up the processes but cannot recover the Silo; logoff or reboot is required.
 - **Reopen within ~1 second of closing** — Claude's launcher hands a reopen request to an existing main process if one is still alive. If you click the icon while the old tree is being killed, that request can be lost and nothing appears; click again. The new instance is never killed.
+- **Unexplained termination** — The watchdog process is sometimes killed by something external, for reasons not yet understood. The 10-minute repeat trigger limits the resulting gap in cover; see [Known issue](#known-issue-the-watchdog-is-terminated-unexpectedly).
 
 ## Requirements
 
