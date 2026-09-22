@@ -126,10 +126,31 @@ A single hidden PowerShell process runs in the background as a small state machi
 | `SEARCHING` | Looks for the Claude Desktop main process every 3 s (a cheap `Get-Process` pre-check; the WMI query only runs when a `claude.exe` exists). |
 | `ATTACHED` | Main process found. Waits up to the grace period (default 30 s) for it to show a visible, titled window. A main that never shows one is a headless zombie left over from an earlier session — its tree is killed when the grace period expires. |
 | `ARMED` | The window has been seen. When it disappears, the user closed Claude: the process tree rooted at that main PID is killed within ~500 ms. |
+| `UPDATE-WAIT` | Entered *instead of* killing when a Claude update is staged but not yet installed. Nothing is killed; see [Claude updates](#claude-updates) below. |
 
-In `ATTACHED` or `ARMED`, the main process dying (a crash) also kills the tree.
+In `ATTACHED` or `ARMED`, the main process dying (a crash) also kills the tree — unless an update is staged, in which case it goes to `UPDATE-WAIT` too.
 
 Window detection uses Win32 `EnumWindows` + `IsWindowVisible` + `GetWindowTextLength` on the main process's PID. Minimized windows retain the `WS_VISIBLE` flag, so **minimize never triggers cleanup** — this was verified empirically.
+
+### Claude updates
+
+Accepting an in-app update is a two-step handoff, and v1.1 broke it: Claude would close and simply not come back, still on the old version.
+
+1. While Claude is running, it downloads and **stages** the new package. Windows defers registering it because the app is in use.
+2. When you accept, Claude closes its window, and **its own updater — still running inside the old process tree — asks Windows to register the new version**. Windows then shuts the old app down itself, installs the new one, and relaunches it.
+
+A watchdog that kills the tree the instant the window closes destroys the updater before step 2 happens. So v1.2 checks, at the moment the window closes, whether a Claude update is staged (from the `AppXDeploymentServer` event log). If one is, it enters `UPDATE-WAIT` and kills nothing, waiting for one of:
+
+| What happens | What the watchdog does |
+|---|---|
+| Registration of the new version finishes | Nothing to clean up — Windows already shut the old app down. Returns to `SEARCHING`. |
+| The old window comes back | You closed normally, then reopened; the launcher handed that to the same still-running instance. Back to `ARMED`, nothing killed. |
+| A new Claude instance starts, with no update activity | An ordinary close followed by a relaunch. The old tree is killed; the new instance is explicitly spared. |
+| Nothing, for 2 minutes | The update was staged but not accepted; this was an ordinary close. The old tree is killed. |
+
+With no update staged, closing Claude is handled exactly as before. If the deployment log can't be read, the watchdog logs `Update detection: UNAVAILABLE` at startup and treats every close as ordinary (v1.1 behaviour).
+
+The one cost: while an update is staged and you have *not* accepted it, a normal close keeps the zombies for up to 2 minutes instead of half a second. Reopening in that window still works, because it reuses the running instance.
 
 ### Kill scope
 
@@ -180,6 +201,7 @@ If you do end it, the repeat trigger brings it back within 10 minutes.
 - **Kill time**: under 1 second
 - **Steady-state cost while Claude is open**: one `EnumWindows` call per 500 ms, no process enumeration
 - **Cost while Claude is closed**: one `Get-Process` call per 3 s
+- **Cost per close**: one deployment-log query (~80 ms) to check for a staged update
 - **Memory**: ~30 MB (single hidden PowerShell process)
 
 ## Is Anything Worth Keeping Alive?
@@ -207,6 +229,7 @@ If you need work to survive independently of the app, start it in your own termi
 | `-DryRun` | off | Log what would be killed; kill nothing. Useful for checking scope on your machine. |
 | `-GraceSeconds N` | 30 | How long an attached main process may run without a window before it is treated as a zombie. Raise it on a slow machine. |
 | `-HeartbeatMinutes N` | 15 | Interval of the "still alive" log line. |
+| `-UpdateWaitSeconds N` | 120 | With an update staged, how long a closed window may go without Claude's updater registering the new version before the close is treated as ordinary and the tree is killed. |
 | `-LogPath PATH` | `klod-dezombifier.log` next to the script | Log location. Rotated to `.old` when it exceeds 1 MB. |
 
 To try a dry run in the foreground:
@@ -250,6 +273,17 @@ A successful cycle looks like:
 - **denied**: processes that resisted termination (should be 0)
 
 A `Heartbeat: state=ARMED mainPid=40676` line every 15 minutes confirms the watchdog is alive and attached.
+
+Accepting a Claude update should instead look like this — no `Kill:` lines at all:
+
+```
+ARMED: window lost for main PID=58792; user closed Claude; update to Claude_2.8000.0.0_x64__pzs8sxrjxfjjc is staged -> UPDATE-WAIT (not killing; waiting for Claude's updater to register it)
+UPDATE-WAIT: registration started 3s after window loss - this is the update; standing down until it finishes
+UPDATE-WAIT: update registered 35s after window loss; Windows shut the old package down itself - nothing killed
+SEARCHING -> ATTACHED: main PID=61234 ...
+```
+
+The line near the top of the log, right after `STARTED`, should read `Update detection: ... enabled=True`.
 
 ## Removal
 

@@ -258,3 +258,53 @@ Occurrence B — dying five seconds after a kill — looked like strong evidence
 The task carries a 10-minute repeat trigger alongside the logon trigger, so an unexplained death costs at most ~10 minutes of cover. `MultipleInstances=IgnoreNew` plus a single-instance mutex in the script make a repeat fire during normal running a no-op.
 
 This does not fix the deaths. It removes the consequence that actually caused harm: on 2026-09-18 the watchdog died at 15:18 and stayed dead for a full day, because the only trigger was at-logon, and the zombies it exists to remove accumulated unnoticed until the operator found them manually in Task Manager.
+
+## v1.2: The watchdog broke Claude's in-app updates
+
+### Symptom
+
+Accepting a Claude Desktop update closed the app and nothing else happened: no install, no relaunch, still on the old version. Three consecutive attempts on 2026-09-22 failed this way. With the watchdog disabled, the next attempt installed and relaunched normally, which settled the cause before any fix was designed.
+
+### Mechanism: a two-step handoff
+
+The `Microsoft-Windows-AppXDeploymentServer/Operational` log shows the update as two separate deployment operations. Comparing the successful attempt with the three failures, event by event:
+
+| Step | Event | Successful (watchdog off) | Failed ×3 (watchdog on) |
+|---|---|---|---|
+| Stage the new package while Claude runs | 603 Add → 658 deferred registration → 400 Add finished | ✓ 16:06:37 – 16:07:18 | ✓ every time |
+| Updater asks Windows to register it, **after the window closes** | 603 `RegisterByPackageFamilyName`, `ForceApplicationShutdownOption`, calling process `claude.exe` | ✓ 16:09:37 | **never issued** |
+| Windows shuts the old app down, including the packaged `CoworkVMService` | 9648 / 9650 | ✓ 16:10:07 | — |
+| Registration finishes; old package moved to `Deleted` | 400 Register finished, 472 | ✓ 16:10:09 | — |
+| New version launches | new main process, parented to `sihost.exe` | ✓ 16:10:08 | — |
+
+Staging succeeded every time. The failures are missing the second step entirely: the call that registers the staged package is made by Claude's updater from inside the old process tree, after the window has closed. The watchdog killed that tree about half a second after the window disappeared, before the call could be made.
+
+An earlier hypothesis — that a force-kill leaves the MSIX container half torn down, so Windows never sees the package as free — was wrong, and so was the fix it implied (terminate more gracefully). The updater does not need to die more politely; it needs to survive long enough to make the call.
+
+Three measurements shaped the fix:
+
+- **Windows' own shutdown leaves nothing behind.** After the successful update, zero processes remained from the old package, so a watchdog that stands down during an update loses nothing.
+- **The relaunched main is parented to `sihost.exe`**, not to the old main. A kill rooted at the old main can never reach it.
+- **Registration is readable from structured event fields**, independent of display language: 658 `PackageMoniker2` is the deferred package; 400 with `DeploymentOperation` other than `1` (Add) is a finished registration; 603 whose `Path` is a family name rather than a `.msix` is a registration starting. The query takes about 80 ms, and the log reached back 8 days on the development machine.
+
+### Fix
+
+At every point where v1.1 would kill, the watchdog first checks whether a Claude package is staged but not registered: the newest 658 for Claude with no later finished registration of that package, and newer than the currently registered version. If so, it enters `UPDATE-WAIT`, where nothing is killed. It leaves that state when:
+
+- the registration finishes (Windows has already cleaned up; nothing to do);
+- the old main's window comes back (an ordinary close followed by a reopen, which the launcher hands to the same still-running instance);
+- a Claude main created after the window closed appears — with registration seen, nothing is killed; without it, this was an ordinary close followed by a relaunch, so the old tree is killed with the new main explicitly excluded;
+- 120 s pass with no registration (`-UpdateWaitSeconds`): the update was staged but not accepted, so the old tree is killed;
+- a registration has run for 600 s without finishing: it is left to Windows, and nothing is killed.
+
+The window-coming-back case was found during design, not testing. Without it, closing Claude normally while an update was staged, then reopening within two minutes, would have left the watchdog waiting on a process that was by then the running application — and the timeout would have killed it.
+
+Failures in update detection are treated as "no update staged", so a broken query degrades to v1.1 behaviour rather than wedging the loop. Startup logs whether the deployment log is readable.
+
+### Testing
+
+- **Detection replayed against the real log, 22 checks.** The functions were extracted from the shipped script and run as of historical moments that day: pending while each staged update sat unregistered, still pending mid-registration at 16:09:50, not pending once registration finished at 16:10:09, and not pending on a machine already newer than the staged version. Registration-activity checks confirm that staging alone never counts as registration — the case most likely to fool a naive implementation.
+- **The state machine driven through 11 scenarios, 24 checks.** The actual body of the main loop, extracted from the script, was run with system calls stubbed and a fake clock: accepted update, ordinary close then reopen into the same instance, ordinary close with no reopen, relaunch as a new instance, a pre-existing main not mistaken for a new one, update with no staged package (identical to v1.1), detection throwing, registration never finishing, a watchdog restarted mid-update, the main already dead, and the registration check throwing during the wait.
+- **Mutation testing, 3 of 3 caught.** Planting three bugs in copies of the script — dropping the window-came-back check, dropping the "created after the close" guard, and ignoring pending updates altogether (the original defect) — made exactly the scenarios aimed at them fail. The last one failed 14 checks across 9 scenarios. This establishes that the simulation exercises the real code rather than its stubs.
+
+Not yet exercised end to end: a real update accepted with v1.2 running. The first one will log how long after the window closes Claude's updater makes its registration call. That gap has never been measured and is the number that would justify tightening the 120-second wait.
