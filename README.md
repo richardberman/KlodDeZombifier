@@ -13,11 +13,13 @@ Download `klod-dezombifier.ps1`. Then, from the folder you downloaded it to, in 
 New-Item -ItemType Directory -Path "$env:USERPROFILE\.claude\scripts" -Force
 Copy-Item klod-dezombifier.ps1 "$env:USERPROFILE\.claude\scripts\"
 
-# Run it at every logon
+# Run it at every logon, through a headless console host (no window at all)
 $script   = "$env:USERPROFILE\.claude\scripts\klod-dezombifier.ps1"
+$conhost  = "$env:SystemRoot\System32\conhost.exe"
+$pwsh     = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $psArgs   = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden"
-$action   = New-ScheduledTaskAction -Execute powershell.exe `
-                -Argument "$psArgs -File `"$script`""
+$action   = New-ScheduledTaskAction -Execute $conhost `
+                -Argument "--headless $pwsh $psArgs -File `"$script`""
 $trigger  = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
                 -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
@@ -31,8 +33,12 @@ Register-ScheduledTask -TaskName KlodDeZombifier `
 Start-ScheduledTask -TaskName KlodDeZombifier
 ```
 
+Launching through `conhost.exe --headless` matters: on Windows 11 a plain
+`powershell.exe -WindowStyle Hidden` task opens a visible Windows Terminal
+window, and closing it kills the watchdog (see [No window](#no-window-why-it-launches-through-conhost---headless)).
+
 Then add the 10-minute repeat trigger, so the watchdog restarts itself if it
-is ever killed (see [Known issue](#known-issue-the-watchdog-is-terminated-unexpectedly)).
+is ever killed.
 This needs an XML edit: "repeat forever" is expressed by *omitting* the
 `<Duration>` element, and passing `-RepetitionDuration ([TimeSpan]::MaxValue)`
 to the cmdlet is rejected by the service as out of range.
@@ -163,37 +169,29 @@ Windows keeps a process's parent PID even after the parent has died, so the tree
 
 The watchdog itself sits outside that tree: the scheduled task parents it to the Task Scheduler service, not to Claude. It also explicitly subtracts its own PID and everything below it from the kill set before terminating anything, so no parent chain can route the walk back into itself.
 
-## Known issue: the watchdog is terminated unexpectedly
+## No window: why it launches through `conhost --headless`
 
-**The watchdog process sometimes dies on its own, and the cause is not known.**
+**This was the "unexplained termination" earlier versions of this README listed as a known issue. Solved 2026-09-23.**
 
-Observed three times on the development machine (Windows 11 Pro 26200):
+On Windows 11 the default terminal ("Let Windows decide") is Windows Terminal. When Task Scheduler starts a console program such as `powershell.exe`, Windows hands its console to Windows Terminal, which opens a visible window titled with the `powershell.exe` path. `-WindowStyle Hidden` cannot hide it: that switch only affects the old console host's window.
 
-| Started | Died | Lifetime | What was happening |
-|---|---|---|---|
-| 13:08:13 | between 14:08 and 15:07 | 60–119 min | Idle, Claude open |
-| 15:15:22 | 15:18:29 | 3 min | ~5 s after a kill |
-| 22:26:56 | 22:49:23 | 22 min | Idle, Claude open and never closed, no kill had run |
+That window *was* the watchdog's console, so **closing it killed the watchdog.** Windows sends the program a console close event, and it exits with `0xC000013A` (`STATUS_CONTROL_C_EXIT`). That explains every symptom of the deaths that were recorded as unexplained:
 
-Every time the signature is identical: Task Scheduler records the action ending with return code `3221225786` (`0xC000013A`, `STATUS_CONTROL_C_EXIT`); the script's own `try/catch` never fires; nothing is written to the log; and no Windows event records a cause. Task Scheduler logs it as *successfully completed*, so `RestartOnFailure` does not apply.
+- the script's `try/catch` never fired and nothing was logged, because a console close is not an exception;
+- Task Scheduler reported a normal completion, because to it the program simply exited;
+- they came at irregular times, because they happened whenever a stray-looking terminal window got closed.
 
-Ruled out so far: the script's own kill path (occurrence 3 had no kill), idle settings, `ExecutionTimeLimit`, antivirus (Bitdefender's own logs show nothing), the Task Scheduler service stopping, PID reuse in the tree walk, and self-termination. The second occurrence looked like the kill caused it; the third shows that was coincidence.
+The 10-minute repeat trigger is what finally exposed it: every close was followed a few minutes later by a fresh window.
 
-If you have seen this and know the mechanism, please open an issue.
+The task now starts `conhost.exe --headless`, which gives PowerShell a console with no window at all. Nothing appears, so there is nothing to close. `--headless` is how Windows itself starts the console host for pseudo-consoles; it isn't documented for direct use, so if a future Windows changes it, the fallback is a small compiled launcher. The fix lives in the task definition instead of changing your default terminal, which would affect every console program on the machine.
 
-### Mitigation: it restarts itself
+### The repeat trigger stays
 
-Because the cause is unknown, the task carries **two** triggers: at logon, and a repeat every 10 minutes. `MultipleInstances` is `IgnoreNew` and the script holds a single-instance mutex, so a repeat firing while it is already running is a no-op — the second copy logs `already running` and exits.
+The task keeps **two** triggers: at logon, and a repeat every 10 minutes. `MultipleInstances` is `IgnoreNew` and the script holds a single-instance mutex, so a repeat firing while it is already running is a no-op — the second copy logs `already running` and exits. It is now a safety net for any death, rather than the only thing standing between a death and a day without cover.
 
-The practical effect is that an unexplained death costs at most ~10 minutes of cover instead of lasting until the next logon. Without the repeat trigger, the watchdog on the development machine died and stayed dead for a full day, and the zombies it exists to remove piled up unnoticed.
+### Finding it in Task Manager
 
-### It looks like junk in Task Manager
-
-The watchdog appears under **Background processes** as plain **`Windows PowerShell`**, with no window title, alongside any other PowerShell on the machine. There is nothing to distinguish it — which makes it exactly the kind of entry you end while cleaning up strays.
-
-To identify it: **Details** tab, right-click the column headers, add **Command line**. The watchdog is the one ending in `klod-dezombifier.ps1`.
-
-If you do end it, the repeat trigger brings it back within 10 minutes.
+With no window, it has no app entry. Its processes are `conhost.exe` (Console Window Host) and `powershell.exe` (Windows PowerShell), easy to mistake for strays. To identify it: **Details** tab, right-click the column headers, add **Command line**; the watchdog's ends in `klod-dezombifier.ps1`. If you end it, the repeat trigger brings it back within 10 minutes.
 
 ### Performance
 
@@ -298,7 +296,8 @@ Remove-Item "$env:USERPROFILE\.claude\scripts\klod-dezombifier.log*" -ErrorActio
 - **Session-level orphans** — Closing an individual Code tab (without closing the whole app) can also leave orphaned subprocesses. These accumulate until the main app is closed, at which point the watchdog kills them all.
 - **Silo corruption** — If Claude crashes during startup, the MSIX Silo handle may not be released. The watchdog cleans up the processes but cannot recover the Silo; logoff or reboot is required.
 - **Reopen within ~1 second of closing** — Claude's launcher hands a reopen request to an existing main process if one is still alive. If you click the icon while the old tree is being killed, that request can be lost and nothing appears; click again. The new instance is never killed.
-- **Unexplained termination** — The watchdog process is sometimes killed by something external, for reasons not yet understood. The 10-minute repeat trigger limits the resulting gap in cover; see [Known issue](#known-issue-the-watchdog-is-terminated-unexpectedly).
+- **Installed without `conhost --headless`** — On Windows 11 a visible terminal window appears for the watchdog, and closing it stops the watchdog until the repeat trigger restarts it. See [No window](#no-window-why-it-launches-through-conhost---headless).
+- **The Cowork service is left alone** — `CoworkVMService` (`cowork-svc.exe`) shows up under a "Claude" heading in Task Manager even with Claude closed. It is a Windows service that starts at boot, not part of the app's process tree, so the watchdog never touches it.
 
 ## Requirements
 

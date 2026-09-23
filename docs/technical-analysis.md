@@ -211,11 +211,37 @@ Three properties this run established that the earlier tests did not:
 - **The kill works end to end from the installed artifact.** Window loss to empty tree in 449 ms, with the script, task registration and defaults a user would actually get.
 - **The watchdog was still alive immediately afterwards** (PID 26032), so the kill does not synchronously take it down.
 
-**A claim this section previously made, now withdrawn.** It asserted that "the watchdog survives the kill it performs," treating one observation as a general property. Nineteen minutes after this run the same process was gone, and two further instances died without performing any kill at all. Surviving a kill once did not establish that it survives kills, and the claim should never have been written in that form. See [Unexplained termination](#unexplained-termination-open) below.
+**A claim this section previously made, now withdrawn.** It asserted that "the watchdog survives the kill it performs," treating one observation as a general property. Nineteen minutes after this run the same process was gone, and two further instances died without performing any kill at all. Surviving a kill once did not establish that it survives kills, and the claim should never have been written in that form. See [Unexplained termination](#unexplained-termination-resolved-2026-09-23) below.
 
 **The `AtLogOn` trigger** was confirmed on 2026-09-18: a logoff/logon cycle produced a fresh `KLOD DEZOMBIFIER v1.1 STARTED` line at 15:09:32 with a new PID parented to the Task Scheduler service.
 
-## Unexplained termination (open)
+## Unexplained termination (resolved 2026-09-23)
+
+### Resolution
+
+**The watchdog's console was being shown in a visible Windows Terminal window, and closing that window killed it.**
+
+On Windows 11, when the default terminal is "Let Windows decide" — which means Windows Terminal — a console program started by Task Scheduler has its console handed to Windows Terminal. The watchdog, launched as `powershell.exe -WindowStyle Hidden`, got a visible Windows Terminal window titled with the `powershell.exe` path. `-WindowStyle Hidden` only hides a classic console host window, so it had no effect. Closing the window delivers a console close event, and the process exits with `0xC000013A`.
+
+Evidence, 2026-09-23:
+
+- `WindowsTerminal.exe` and `OpenConsole.exe` were created in the same second as the running watchdog, and the only visible Windows Terminal window was titled `C:\windows\System32\WindowsPowerShell\v1.0\powershell.exe`.
+- The operator had been closing that stray window. Watchdog instances ended with `0xC000013A` at 06:29:00, 06:30:21 and 07:32:01, each followed by the 10-minute repeat trigger starting a new instance — and a new window. That repetition is what finally made the pattern visible.
+- Reproduced on purpose: starting `powershell.exe -WindowStyle Hidden` opened a Windows Terminal window; the same command started through `conhost.exe --headless` opened none.
+
+Every recorded property of the deaths follows from this: no exception and no log line, because a console close is not an exception; a normal completion in Task Scheduler with no stop events, because the program simply exited; irregular timing, because they happened whenever a stray window got closed. Occurrence C ended eleven seconds before an elevated script was run — consistent with windows being tidied while an elevated PowerShell was opened.
+
+**Fix.** The task action is now `conhost.exe --headless powershell.exe …`, which gives the watchdog a console with no window. Verified after the change: one watchdog, parented to the headless console host; zero visible windows owned by it or its host; no Windows Terminal or OpenConsole process running; window detection unaffected (it attached and armed on Claude immediately). The default terminal setting was deliberately left alone, since changing it would affect every console program on the machine.
+
+### Why the investigation missed it
+
+- **A check on the wrong process.** An earlier check read the `MainWindowTitle` of the watchdog's `powershell.exe`, found it empty, and concluded the watchdog had no window. `powershell.exe` indeed owned no window — its console was drawn by a separate `WindowsTerminal.exe` process. That conclusion was then carried into every later hypothesis as a fact.
+- **The decisive test was proposed and never run.** The six-lens investigation's synthesis named exactly this as its zero-risk linchpin test — does a Task-Scheduler-launched hidden PowerShell own a console? — and it was set aside when attention moved to mitigation.
+- **"Someone ended it in Task Manager" came close, and was dismissed for the wrong reason.** It was rejected because occurrence C happened while an unrelated elevated script was being run, which is precisely when stray windows get closed.
+
+The record below was written on 2026-09-19, before the cause was known, and is kept as it was.
+
+### Record at the time
 
 The watchdog process is terminated by something external at irregular intervals. **The cause is unknown.**
 
@@ -232,7 +258,7 @@ Identical signature every time:
 - Task Scheduler logs `id=201` + `id=102` — *successfully completed* — with no `id=330` (stopped by user) and no `id=111` (terminated by scheduler). It observed the exit; it did not cause it.
 - Because the scheduler sees a normal completion, `RestartOnFailure` never applies.
 
-### Ruled out
+#### Ruled out
 
 | Candidate | Why it is out |
 |---|---|
@@ -247,13 +273,13 @@ Identical signature every time:
 | A script exception | `try/catch` would have logged it |
 | Someone ending it in Task Manager | Plausible for one occurrence, but C happened while the operator was running an unrelated elevated script |
 
-### Investigation notes
+#### Investigation notes
 
 Occurrence B — dying five seconds after a kill — looked like strong evidence the kill was responsible, and a six-lens investigation was built on that premise. Occurrence C falsified it: same signature, no kill, nothing happening. The correlation in B was coincidence. Anyone picking this up should treat the kill path as exonerated and look for an external terminator.
 
 `0xC000013A` is the status Windows sets when a console process is terminated via a console control event, which is why the console family of hypotheses was explored at length. Nothing confirmed one, and no candidate explains a process dying while idle with no console activity anywhere near it.
 
-### Mitigation
+#### Mitigation
 
 The task carries a 10-minute repeat trigger alongside the logon trigger, so an unexplained death costs at most ~10 minutes of cover. `MultipleInstances=IgnoreNew` plus a single-instance mutex in the script make a repeat fire during normal running a no-op.
 

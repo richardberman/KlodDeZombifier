@@ -43,8 +43,11 @@
 #                         treated as an ordinary close (default 120)
 #   -LogPath PATH         log file (default: klod-dezombifier.log next to script)
 #
-# Install: see README.md (Quickstart). The scheduled task needs both a logon
-# trigger and a 10-minute repeat trigger.
+# Install: see README.md (Quickstart). The scheduled task needs a logon trigger
+# and a 10-minute repeat trigger, and must launch through
+# "conhost.exe --headless". Without it, Windows 11 shows the watchdog's console
+# in a Windows Terminal window, and closing that window kills the watchdog
+# (exit 0xC000013A).
 #
 # Remove:
 #   Unregister-ScheduledTask -TaskName "KlodDeZombifier" -Confirm:$false
